@@ -154,6 +154,11 @@ Open it with:
 screen /dev/cu.usbmodemXXXX 115200
 ```
 
+or
+```sh
+python3 -m serial.tools.miniterm /dev/cu.usbmodemXXXXX 115200
+```
+
 ## Firmware Behavior Summary
 
 - Ports `0` and `1` use hardware UARTs
