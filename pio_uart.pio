@@ -1,0 +1,71 @@
+; PIO UART TX - 8N1, LSB first
+; Side-set pin is TX pin, directly drives output
+; 8 cycles per bit
+
+.program pio_uart_tx
+.side_set 1 opt
+
+    pull       side 1 [7]  ; Stall with TX high (idle), then assert stop bit
+    set x, 7   side 0 [7]  ; Assert start bit, preload bit counter
+bitloop:
+    out pins, 1            ; Shift out data bit (LSB first)
+    jmp x-- bitloop   [6]  ; Loop 8 times, 8 cycles per bit
+
+
+; PIO UART RX - 8N1, LSB first
+; IN pin 0 is RX
+; 8 cycles per bit
+
+.program pio_uart_rx
+
+    wait 0 pin 0           ; Wait for start bit (line goes low)
+    set x, 7    [10]       ; Delay to center of first data bit (1.5 bit times)
+bitloop:
+    in pins, 1             ; Sample data bit
+    jmp x-- bitloop   [6]  ; Loop 8 times, 8 cycles per bit
+    push                   ; Push 8-bit value to RX FIFO
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void pio_uart_tx_program_init(PIO pio, uint sm, uint offset, uint pin, uint baud) {
+    // Set TX pin high (idle) and configure as output
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_gpio_init(pio, pin);
+
+    pio_sm_config c = pio_uart_tx_program_get_default_config(offset);
+    sm_config_set_out_shift(&c, true, false, 32);  // Shift right (LSB first), no autopull
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX); // 8-deep TX FIFO
+    sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (8 * baud));
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void pio_uart_rx_program_init(PIO pio, uint sm, uint offset, uint pin, uint baud) {
+    pio_gpio_init(pio, pin);
+    gpio_pull_up(pin);  // Pull up when idle (UART idle = high)
+
+    pio_sm_config c = pio_uart_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_in_shift(&c, true, false, 32);   // Shift right (LSB first), no autopush
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX); // 8-deep RX FIFO
+    sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / (8 * baud));
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void pio_uart_tx_set_baud(PIO pio, uint sm, uint baud) {
+    pio_sm_set_clkdiv(pio, sm, (float)clock_get_hz(clk_sys) / (8 * baud));
+}
+
+static inline void pio_uart_rx_set_baud(PIO pio, uint sm, uint baud) {
+    pio_sm_set_clkdiv(pio, sm, (float)clock_get_hz(clk_sys) / (8 * baud));
+}
+%}
