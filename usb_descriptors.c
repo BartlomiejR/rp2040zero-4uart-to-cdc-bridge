@@ -11,7 +11,7 @@ static const tusb_desc_device_t desc_device = {
     .bDeviceProtocol    = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0x2E8A,   // Raspberry Pi
-    .idProduct          = 0x4004,   // Custom PID for 4-port bridge
+    .idProduct          = 0x4004,   // Keep original PID for host-side rules
     .bcdDevice          = 0x0100,
     .iManufacturer      = 1,
     .iProduct           = 2,
@@ -30,6 +30,7 @@ uint8_t const *tud_descriptor_device_cb(void) {
 //   CDC 1: notif=0x84, out=0x05, in=0x85
 //   CDC 2: notif=0x87, out=0x08, in=0x88
 //   CDC 3: notif=0x8A, out=0x0B, in=0x8B
+//   CDC 4: notif=0x8D, out=0x0E, in=0x8E
 
 enum {
     ITF_NUM_CDC0 = 0,
@@ -40,10 +41,12 @@ enum {
     ITF_NUM_CDC2_DATA,
     ITF_NUM_CDC3,
     ITF_NUM_CDC3_DATA,
+    ITF_NUM_CDC4,
+    ITF_NUM_CDC4_DATA,
     ITF_NUM_TOTAL
 };
 
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + 4 * TUD_CDC_DESC_LEN)
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + 5 * TUD_CDC_DESC_LEN)
 
 #define EPNUM_CDC0_NOTIF  0x81
 #define EPNUM_CDC0_OUT    0x02
@@ -61,6 +64,10 @@ enum {
 #define EPNUM_CDC3_OUT    0x0B
 #define EPNUM_CDC3_IN     0x8B
 
+#define EPNUM_CDC4_NOTIF  0x8D
+#define EPNUM_CDC4_OUT    0x0E
+#define EPNUM_CDC4_IN     0x8E
+
 static const uint8_t desc_configuration[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN,
                           0x00, 500),
@@ -76,6 +83,9 @@ static const uint8_t desc_configuration[] = {
 
     TUD_CDC_DESCRIPTOR(ITF_NUM_CDC3, 7, EPNUM_CDC3_NOTIF, 8,
                        EPNUM_CDC3_OUT, EPNUM_CDC3_IN, 64),
+
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC4, 8, EPNUM_CDC4_NOTIF, 8,
+                       EPNUM_CDC4_OUT, EPNUM_CDC4_IN, 64),
 };
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
@@ -87,12 +97,13 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 static const char *const string_desc_arr[] = {
     [0] = (const char[]){0x09, 0x04},  // English (US)
     [1] = "RP2040 Bridge",             // Manufacturer
-    [2] = "4-Port UART Bridge",        // Product
+    [2] = "4-Port UART Bridge",     // Keep original product string for host-side rules
     [3] = NULL,                        // Serial (generated at runtime)
     [4] = "UART0 - LiDAR",              // CDC 0
     [5] = "UART1 - DDSM115",            // CDC 1
     [6] = "UART2 - IMU",               // CDC 2
     [7] = "UART3 - Aux",               // CDC 3
+    [8] = "Bridge Diagnostics",        // CDC 4
 };
 
 static uint16_t _desc_str[33];

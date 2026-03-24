@@ -6,10 +6,10 @@
 #define CFG_TUSB_RHPORT0_MODE   OPT_MODE_DEVICE
 #define CFG_TUD_ENABLED         1
 
-// 4 CDC interfaces - one per UART port
-#define CFG_TUD_CDC         4
+// 5 CDC interfaces - four UART bridges plus one diagnostics console
+#define CFG_TUD_CDC         5
 #define CFG_TUD_CDC_RX_BUFSIZE  512
-#define CFG_TUD_CDC_TX_BUFSIZE  512
+#define CFG_TUD_CDC_TX_BUFSIZE  1024
 
 // Disable unused classes
 #define CFG_TUD_MSC         0

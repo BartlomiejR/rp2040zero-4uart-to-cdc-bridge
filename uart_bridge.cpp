@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
@@ -29,6 +31,11 @@
 #define BAUD_LIDAR        230400  // Port 0: YDLidar TMini Plus
 #define BAUD_IMU          230400  // Port 2: IMU
 
+#define BRIDGE_PORT_COUNT 4
+#define TOTAL_CDC_COUNT   5
+#define DIAG_CDC_ITF      4
+#define DIAG_REPORT_INTERVAL_MS 1000
+
 // --- PIO state ---
 static PIO pio_uart_pio = pio0;
 
@@ -39,12 +46,220 @@ static uint pio_tx_offset;
 static uint pio_rx_offset;
 
 // Current baud rates
-static uint32_t port_baud[4] = {BAUD_LIDAR, DEFAULT_BAUD, BAUD_IMU, DEFAULT_BAUD};
+static uint32_t port_baud[BRIDGE_PORT_COUNT] = {BAUD_LIDAR, DEFAULT_BAUD, BAUD_IMU, DEFAULT_BAUD};
 
 // --- Intermediate buffers for USB<->UART bridging ---
 static uint8_t bridge_buf[64];
+static char diag_report_buf[1024];
+
+static const char *const port_names[BRIDGE_PORT_COUNT] = {
+    "LiDAR",
+    "DDSM115",
+    "IMU",
+    "Aux",
+};
+
+struct uart_bridge_stats_t {
+    uint64_t usb_to_uart_bytes;
+    uint64_t uart_to_usb_bytes;
+    uint64_t uart_to_usb_drop_bytes;
+};
+
+struct cdc_stats_t {
+    cdc_line_coding_t line_coding;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t tx_drop_bytes;
+    bool connected;
+    bool dtr;
+    bool rts;
+};
+
+struct report_snapshot_t {
+    uint64_t usb_to_uart_bytes;
+    uint64_t uart_to_usb_bytes;
+    uint64_t uart_to_usb_drop_bytes;
+    uint64_t cdc_rx_bytes;
+    uint64_t cdc_tx_bytes;
+    uint64_t cdc_tx_drop_bytes;
+};
+
+static uart_bridge_stats_t port_stats[BRIDGE_PORT_COUNT];
+static cdc_stats_t cdc_stats[TOTAL_CDC_COUNT] = {
+    {{BAUD_LIDAR, 0, 0, 8}, 0, 0, 0, false, false, false},
+    {{DEFAULT_BAUD, 0, 0, 8}, 0, 0, 0, false, false, false},
+    {{BAUD_IMU, 0, 0, 8}, 0, 0, 0, false, false, false},
+    {{DEFAULT_BAUD, 0, 0, 8}, 0, 0, 0, false, false, false},
+    {{DEFAULT_BAUD, 0, 0, 8}, 0, 0, 0, false, false, false},
+};
+static report_snapshot_t last_report[BRIDGE_PORT_COUNT];
+static uint32_t next_diag_report_ms;
+static uint32_t diag_report_seq;
 
 // --- Init functions ---
+
+static const char *parity_to_str(uint8_t parity) {
+    switch (parity) {
+        case 1: return "O";
+        case 2: return "E";
+        case 3: return "M";
+        case 4: return "S";
+        default: return "N";
+    }
+}
+
+static const char *stop_bits_to_str(uint8_t stop_bits) {
+    switch (stop_bits) {
+        case 1: return "1.5";
+        case 2: return "2";
+        default: return "1";
+    }
+}
+
+static bool uart_rx_pending(uint8_t port) {
+    switch (port) {
+        case 0: return uart_is_readable(uart0);
+        case 1: return uart_is_readable(uart1);
+        case 2: return !pio_sm_is_rx_fifo_empty(pio_uart_pio, pio_rx_sm[0]);
+        case 3: return !pio_sm_is_rx_fifo_empty(pio_uart_pio, pio_rx_sm[1]);
+        default: return false;
+    }
+}
+
+static void refresh_cdc_connection_state() {
+    for (uint8_t itf = 0; itf < TOTAL_CDC_COUNT; ++itf) {
+        cdc_stats[itf].connected = tud_cdc_n_connected(itf);
+    }
+}
+
+static void diag_count_tx(uint32_t written, uint32_t dropped) {
+    cdc_stats[DIAG_CDC_ITF].tx_bytes += written;
+    cdc_stats[DIAG_CDC_ITF].tx_drop_bytes += dropped;
+}
+
+static void diag_write_text(const char *text, size_t len) {
+    if (!tud_cdc_n_connected(DIAG_CDC_ITF) || len == 0) {
+        return;
+    }
+
+    uint32_t available = tud_cdc_n_write_available(DIAG_CDC_ITF);
+    if (available == 0) {
+        diag_count_tx(0, (uint32_t)len);
+        return;
+    }
+
+    uint32_t to_write = (len <= available) ? (uint32_t)len : available;
+    uint32_t written = tud_cdc_n_write(DIAG_CDC_ITF, text, to_write);
+    tud_cdc_n_write_flush(DIAG_CDC_ITF);
+    diag_count_tx(written, (uint32_t)len - written);
+}
+
+static void emit_diagnostics_report(bool force) {
+    refresh_cdc_connection_state();
+
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (!force && now_ms < next_diag_report_ms) {
+        return;
+    }
+
+    next_diag_report_ms = now_ms + DIAG_REPORT_INTERVAL_MS;
+
+    if (!cdc_stats[DIAG_CDC_ITF].connected) {
+        return;
+    }
+
+    size_t used = 0;
+    int len = snprintf(
+        diag_report_buf + used, sizeof(diag_report_buf) - used,
+        "\r\n[diag %lu] up=%lums usb=%u diag(dtr=%u rts=%u rx=%llu tx=%llu drop=%llu baud=%lu %u%s%s)\r\n",
+        (unsigned long)diag_report_seq++,
+        (unsigned long)now_ms,
+        tud_mounted() ? 1u : 0u,
+        cdc_stats[DIAG_CDC_ITF].dtr ? 1u : 0u,
+        cdc_stats[DIAG_CDC_ITF].rts ? 1u : 0u,
+        (unsigned long long)cdc_stats[DIAG_CDC_ITF].rx_bytes,
+        (unsigned long long)cdc_stats[DIAG_CDC_ITF].tx_bytes,
+        (unsigned long long)cdc_stats[DIAG_CDC_ITF].tx_drop_bytes,
+        (unsigned long)cdc_stats[DIAG_CDC_ITF].line_coding.bit_rate,
+        (unsigned)cdc_stats[DIAG_CDC_ITF].line_coding.data_bits,
+        parity_to_str(cdc_stats[DIAG_CDC_ITF].line_coding.parity),
+        stop_bits_to_str(cdc_stats[DIAG_CDC_ITF].line_coding.stop_bits)
+    );
+    if (len < 0) {
+        return;
+    }
+    used += (size_t)len;
+
+    for (uint8_t port = 0; port < BRIDGE_PORT_COUNT && used < sizeof(diag_report_buf); ++port) {
+        uint64_t delta_usb_to_uart = port_stats[port].usb_to_uart_bytes - last_report[port].usb_to_uart_bytes;
+        uint64_t delta_uart_to_usb = port_stats[port].uart_to_usb_bytes - last_report[port].uart_to_usb_bytes;
+        uint64_t delta_uart_drop = port_stats[port].uart_to_usb_drop_bytes - last_report[port].uart_to_usb_drop_bytes;
+        uint64_t delta_cdc_rx = cdc_stats[port].rx_bytes - last_report[port].cdc_rx_bytes;
+        uint64_t delta_cdc_tx = cdc_stats[port].tx_bytes - last_report[port].cdc_tx_bytes;
+        uint64_t delta_cdc_drop = cdc_stats[port].tx_drop_bytes - last_report[port].cdc_tx_drop_bytes;
+
+        len = snprintf(
+            diag_report_buf + used, sizeof(diag_report_buf) - used,
+            "P%u %-7s c=%u dtr=%u rts=%u uart=%s pend=%u baud=%lu %u%s%s usb>uart=%llu(+%llu) uart>usb=%llu(+%llu) drop=%llu(+%llu) cdc_rx=%llu(+%llu) cdc_tx=%llu(+%llu) cdrop=%llu(+%llu)\r\n",
+            port,
+            port_names[port],
+            cdc_stats[port].connected ? 1u : 0u,
+            cdc_stats[port].dtr ? 1u : 0u,
+            cdc_stats[port].rts ? 1u : 0u,
+            port < 2 ? "HW" : "PIO",
+            uart_rx_pending(port) ? 1u : 0u,
+            (unsigned long)port_baud[port],
+            (unsigned)cdc_stats[port].line_coding.data_bits,
+            parity_to_str(cdc_stats[port].line_coding.parity),
+            stop_bits_to_str(cdc_stats[port].line_coding.stop_bits),
+            (unsigned long long)port_stats[port].usb_to_uart_bytes,
+            (unsigned long long)delta_usb_to_uart,
+            (unsigned long long)port_stats[port].uart_to_usb_bytes,
+            (unsigned long long)delta_uart_to_usb,
+            (unsigned long long)port_stats[port].uart_to_usb_drop_bytes,
+            (unsigned long long)delta_uart_drop,
+            (unsigned long long)cdc_stats[port].rx_bytes,
+            (unsigned long long)delta_cdc_rx,
+            (unsigned long long)cdc_stats[port].tx_bytes,
+            (unsigned long long)delta_cdc_tx,
+            (unsigned long long)cdc_stats[port].tx_drop_bytes,
+            (unsigned long long)delta_cdc_drop
+        );
+        if (len < 0) {
+            break;
+        }
+        if ((size_t)len >= sizeof(diag_report_buf) - used) {
+            used = sizeof(diag_report_buf) - 1;
+            break;
+        }
+        used += (size_t)len;
+
+        last_report[port].usb_to_uart_bytes = port_stats[port].usb_to_uart_bytes;
+        last_report[port].uart_to_usb_bytes = port_stats[port].uart_to_usb_bytes;
+        last_report[port].uart_to_usb_drop_bytes = port_stats[port].uart_to_usb_drop_bytes;
+        last_report[port].cdc_rx_bytes = cdc_stats[port].rx_bytes;
+        last_report[port].cdc_tx_bytes = cdc_stats[port].tx_bytes;
+        last_report[port].cdc_tx_drop_bytes = cdc_stats[port].tx_drop_bytes;
+    }
+
+    diag_write_text(diag_report_buf, used);
+}
+
+static void service_diag_cdc_rx() {
+    if (!tud_cdc_n_available(DIAG_CDC_ITF)) {
+        return;
+    }
+
+    uint32_t count = tud_cdc_n_read(DIAG_CDC_ITF, bridge_buf, sizeof(bridge_buf));
+    cdc_stats[DIAG_CDC_ITF].rx_bytes += count;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if (bridge_buf[i] == '\r' || bridge_buf[i] == '\n' || bridge_buf[i] == '?') {
+            emit_diagnostics_report(true);
+            break;
+        }
+    }
+}
 
 static void hw_uart_init_port(uart_inst_t *uart, uint tx_pin, uint rx_pin, uint baud) {
     uart_init(uart, baud);
@@ -93,7 +308,11 @@ static void set_port_baud(uint8_t port, uint32_t baud) {
 extern "C" {
 
 void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *p_line_coding) {
-    if (itf < 4) {
+    if (itf < TOTAL_CDC_COUNT) {
+        cdc_stats[itf].line_coding = *p_line_coding;
+    }
+
+    if (itf < BRIDGE_PORT_COUNT) {
         set_port_baud(itf, p_line_coding->bit_rate);
 
         // For hardware UARTs, also apply data bits, parity, stop bits
@@ -126,6 +345,14 @@ void tud_cdc_line_coding_cb(uint8_t itf, cdc_line_coding_t const *p_line_coding)
     }
 }
 
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
+    if (itf < TOTAL_CDC_COUNT) {
+        cdc_stats[itf].dtr = dtr;
+        cdc_stats[itf].rts = rts;
+        cdc_stats[itf].connected = tud_cdc_n_connected(itf);
+    }
+}
+
 } // extern "C"
 
 // --- Bridge data transfer ---
@@ -135,6 +362,8 @@ static void bridge_usb_to_hw_uart(uint8_t cdc_itf, uart_inst_t *uart) {
     if (!tud_cdc_n_available(cdc_itf)) return;
 
     uint32_t count = tud_cdc_n_read(cdc_itf, bridge_buf, sizeof(bridge_buf));
+    cdc_stats[cdc_itf].rx_bytes += count;
+    port_stats[cdc_itf].usb_to_uart_bytes += count;
     for (uint32_t i = 0; i < count; i++) {
         uart_putc_raw(uart, bridge_buf[i]);
     }
@@ -146,9 +375,13 @@ static void bridge_hw_uart_to_usb(uint8_t cdc_itf, uart_inst_t *uart) {
     while (uart_is_readable(uart) && count < sizeof(bridge_buf)) {
         bridge_buf[count++] = uart_getc(uart);
     }
-    if (count > 0 && tud_cdc_n_write_available(cdc_itf)) {
-        tud_cdc_n_write(cdc_itf, bridge_buf, count);
+    if (count > 0) {
+        uint32_t written = tud_cdc_n_write(cdc_itf, bridge_buf, count);
         tud_cdc_n_write_flush(cdc_itf);
+        cdc_stats[cdc_itf].tx_bytes += written;
+        cdc_stats[cdc_itf].tx_drop_bytes += count - written;
+        port_stats[cdc_itf].uart_to_usb_bytes += written;
+        port_stats[cdc_itf].uart_to_usb_drop_bytes += count - written;
     }
 }
 
@@ -157,6 +390,8 @@ static void bridge_usb_to_pio_uart(uint8_t cdc_itf, uint pio_idx) {
     if (!tud_cdc_n_available(cdc_itf)) return;
 
     uint32_t count = tud_cdc_n_read(cdc_itf, bridge_buf, sizeof(bridge_buf));
+    cdc_stats[cdc_itf].rx_bytes += count;
+    port_stats[cdc_itf].usb_to_uart_bytes += count;
     for (uint32_t i = 0; i < count; i++) {
         // Blocking put - PIO TX FIFO is 8-deep with joining
         pio_sm_put_blocking(pio_uart_pio, pio_tx_sm[pio_idx], (uint32_t)bridge_buf[i]);
@@ -169,9 +404,13 @@ static void bridge_pio_uart_to_usb(uint8_t cdc_itf, uint pio_idx) {
     while (!pio_sm_is_rx_fifo_empty(pio_uart_pio, pio_rx_sm[pio_idx]) && count < sizeof(bridge_buf)) {
         bridge_buf[count++] = (uint8_t)(pio_sm_get(pio_uart_pio, pio_rx_sm[pio_idx]) >> 24);
     }
-    if (count > 0 && tud_cdc_n_write_available(cdc_itf)) {
-        tud_cdc_n_write(cdc_itf, bridge_buf, count);
+    if (count > 0) {
+        uint32_t written = tud_cdc_n_write(cdc_itf, bridge_buf, count);
         tud_cdc_n_write_flush(cdc_itf);
+        cdc_stats[cdc_itf].tx_bytes += written;
+        cdc_stats[cdc_itf].tx_drop_bytes += count - written;
+        port_stats[cdc_itf].uart_to_usb_bytes += written;
+        port_stats[cdc_itf].uart_to_usb_drop_bytes += count - written;
     }
 }
 
@@ -192,9 +431,11 @@ int main() {
 
     // Initialize TinyUSB
     tusb_init();
+    next_diag_report_ms = to_ms_since_boot(get_absolute_time()) + DIAG_REPORT_INTERVAL_MS;
 
     while (true) {
         tud_task();
+        refresh_cdc_connection_state();
 
         // Bridge all 4 ports
         // Port 0: HW UART0 <-> CDC 0
@@ -212,5 +453,8 @@ int main() {
         // Port 3: PIO UART 1 <-> CDC 3
         bridge_usb_to_pio_uart(3, 1);
         bridge_pio_uart_to_usb(3, 1);
+
+        service_diag_cdc_rx();
+        emit_diagnostics_report(false);
     }
 }
